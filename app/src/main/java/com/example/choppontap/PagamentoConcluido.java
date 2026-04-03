@@ -175,15 +175,31 @@ public class PagamentoConcluido extends AppCompatActivity {
 
         if (msg.startsWith("ACK|")) {
             String ackCmdId = msg.substring(4).trim();
-            Log.i(TAG, "[ACK] Recebido cmd=" + ackCmdId + ", iniciando keepalive PING");
+            Log.i(TAG, "[ACK] Recebido cmd=" + ackCmdId + ", iniciando keepalive PING e watchdog");
             iniciarKeepalive();
+            iniciarWatchdog();
             return;
         }
 
         if (msg.startsWith("WARN:FLOW_TIMEOUT") || msg.startsWith("ERROR:FLOW_TIMEOUT")) {
-            Log.w(TAG, "[KEEPALIVE] Fluxo timeout detectado, cancelando keepalive");
+            Log.w(TAG, "[KEEPALIVE] Fluxo timeout detectado pelo ESP32");
             cancelarKeepalive();
+            cancelarWatchdog();
             if (mBluetoothService != null) mBluetoothService.pararHeartbeat();
+
+            mValvulaAberta = false;
+            atualizarStatus("⏱ Fluxo interrompido. Verifique a torneira.");
+
+            runOnUiThread(() -> {
+                if (liberado < qtd_ml) {
+                    int restante = qtd_ml - liberado;
+                    btnLiberar.setText("Continuar Servindo (" + restante + "ml)");
+                    btnLiberar.setVisibility(View.VISIBLE);
+                    mLiberacaoFinalizada = false;
+                    mComandoEnviado = false; // Permite enviar novo SERVE
+                }
+                mostrarSnackbar("Tempo esgotado sem fluxo.");
+            });
             return;
         }
 
@@ -431,6 +447,22 @@ public class PagamentoConcluido extends AppCompatActivity {
 
         txtQtd.setText(qtd_ml + " ML");
         carregarImagemComFallback();
+
+        // Listener para o botão "Continuar Servindo"
+        btnLiberar.setOnClickListener(v -> {
+            btnLiberar.setVisibility(View.GONE);
+            atualizarStatus("🔄 Retomando liberação...");
+            int restante = qtd_ml - liberado;
+            if (restante > 0) {
+                Log.i(TAG, "[RETRY_SERVE] Reenviando SERVE com volume restante: " + restante + "ml");
+                // Reset flag para permitir novo envio
+                mComandoEnviado = false;
+                iniciarWatchdog();
+                // Envia um novo SERVE com o volume restante
+                enfileirarSERVE(restante, checkout_id, mActiveSessionId);
+            }
+        });
+
         bindService(new Intent(this, BluetoothServiceIndustrial.class), mServiceConnection, BIND_AUTO_CREATE);
     }
 

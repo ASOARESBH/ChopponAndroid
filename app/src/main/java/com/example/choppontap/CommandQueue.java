@@ -225,14 +225,25 @@ public class CommandQueue {
     }
 
     public synchronized void onBleDisconnected() {
-        if (mActive != null) {
-            Log.w(TAG, "[RESET] BLE desconectado durante SERVE — mantendo comando ativo: " + mActive.commandId);
+        Log.w(TAG, "[QUEUE] BLE Desconectado");
+
+        if (mActive != null && mActive.type == BleCommand.Type.SERVE) {
+            // Se já enviamos o SERVE, o ESP32 está trabalhando offline.
+            // NÃO cancelamos o comando. Apenas pausamos os timeouts.
+            Log.i(TAG, "[QUEUE] SERVE em andamento durante desconexão. Mantendo comando ativo para recuperar estado na reconexão.");
             cancelAllTimeouts();
             mPaused = true;
+            // Não chamamos falharComando() aqui.
             return;
+        } else if (mActive != null) {
+            // Para outros comandos (PING, READY), podemos limpar
+            Log.w(TAG, "[QUEUE] Desconexão durante comando não-SERVE (" + mActive.type + ") — limpando");
+            reset();
+            mPaused = true;
+        } else {
+            reset();
+            mPaused = true;
         }
-        reset();
-        mPaused = true;
     }
 
     public synchronized void onBleReady() {

@@ -36,29 +36,15 @@ import java.util.UUID;
 
 /**
  * BluetoothServiceIndustrial - compativel com firmware ASOARESBH/ESP32
- *
  * Protocolo: Nordic UART Service (NUS) - Just Works (sem PIN, sem bond)
  * Scan: por prefixo de nome "CHOPP_" (nao por MAC direto)
  * UUIDs: 6E400001/2/3-B5A3-F393-E0A9-E50E24DCCA9E
- *
- * Fluxo de conexao (conforme ANDROID_BLE_INTEGRACAO.md atualizado 24/04/2026):
- *   1. Scan BLE filtrando nome com prefixo "CHOPP_"
- *   2. connectGatt(context, false, callback, TRANSPORT_LE)
- *   3. onConnectionStateChange(CONNECTED) -> requestMtu(247)
- *   4. onMtuChanged -> discoverServices()
- *   5. onServicesDiscovered -> habilitar notificacoes TX (descriptor 0x2902)
- *   6. onDescriptorWrite -> estado READY
- *   7. READY -> PING a cada 5s; ao receber PONG sessao esta valida
- *
- * Broadcasts emitidos:
- *   BLE_STATUS_ACTION  com extra "status": scanning / connected / ready / disconnected:<motivo>
- *   BLE_DATA_ACTION    com extra "data":   string recebida do ESP32
  */
 @SuppressLint("MissingPermission")
 public class BluetoothServiceIndustrial extends Service {
 
     // -------------------------------------------------------------------------
-    // Constantes publicas
+    // Constantes publicas — nomes novos
     // -------------------------------------------------------------------------
     public static final String TAG = "BLE_INDUSTRIAL";
 
@@ -69,6 +55,16 @@ public class BluetoothServiceIndustrial extends Service {
     public static final String STATUS_CONNECTED    = "connected";
     public static final String STATUS_READY        = "ready";
     public static final String STATUS_DISCONNECTED = "disconnected";
+
+    // -------------------------------------------------------------------------
+    // Aliases de compatibilidade — mantidos para nao quebrar outros arquivos
+    // -------------------------------------------------------------------------
+    public static final String ACTION_CONNECTION_STATUS = BLE_STATUS_ACTION;
+    public static final String ACTION_DATA_AVAILABLE    = BLE_DATA_ACTION;
+    public static final String ACTION_DEVICE_FOUND      = "com.example.choppontap.BLE_DEVICE_FOUND";
+    public static final String EXTRA_STATUS             = "status";
+    public static final String EXTRA_DATA               = "data";
+    public static final String EXTRA_DEVICE             = "device";
 
     // -------------------------------------------------------------------------
     // Singleton
@@ -102,15 +98,15 @@ public class BluetoothServiceIndustrial extends Service {
 
     // Reconexao com backoff exponencial
     private int    mReconnectCount = 0;
-    private static final int    MAX_RECONNECT  = 10;
-    private static final long[] BACKOFF_MS     = {2000,4000,8000,15000,30000,30000,30000,30000,30000,30000};
+    private static final int    MAX_RECONNECT = 10;
+    private static final long[] BACKOFF_MS    = {2000,4000,8000,15000,30000,30000,30000,30000,30000,30000};
 
-    // PING keepalive (a cada 5s em estado READY)
-    private static final long PING_INTERVAL_MS = 5000L;
-    private final Runnable mPingRunnable        = this::sendPing;
-    private final Runnable mScanTimeoutRunnable = this::onScanTimeout;
+    // PING keepalive
+    private static final long PING_INTERVAL_MS  = 5000L;
+    private final Runnable mPingRunnable         = this::sendPing;
+    private final Runnable mScanTimeoutRunnable  = this::onScanTimeout;
 
-    // Notification Foreground Service
+    // Notification
     private static final String CHANNEL_ID = "ble_industrial_channel";
     private static final int    NOTIF_ID   = 1001;
 
@@ -126,7 +122,7 @@ public class BluetoothServiceIndustrial extends Service {
     }
 
     // =========================================================================
-    // Ciclo de vida do Service
+    // Ciclo de vida
     // =========================================================================
 
     @Override
@@ -139,26 +135,19 @@ public class BluetoothServiceIndustrial extends Service {
         }
         try {
             sRunning = true;
-            Log.i(TAG, "=================================");
             Log.i(TAG, "[SERVICE] BluetoothServiceIndustrial v3.0 SINGLETON iniciado");
             Log.i(TAG, "[SERVICE] Protocolo: Nordic UART Service (NUS)");
-            Log.i(TAG, "=================================");
-
             createNotificationChannel();
             startForeground(NOTIF_ID, buildNotification("BLE inicializando..."));
-
             BluetoothManager bm = (BluetoothManager) getSystemService(Context.BLUETOOTH_SERVICE);
             mAdapter = bm != null ? bm.getAdapter() : null;
-
             if (mAdapter == null || !mAdapter.isEnabled()) {
-                Log.e(TAG, "[SERVICE] Bluetooth nao disponivel ou desligado");
+                Log.e(TAG, "[SERVICE] Bluetooth nao disponivel");
                 sRunning = false;
                 stopSelf();
                 return;
             }
-
             Log.i(TAG, "[BOND] BroadcastReceiver de pareamento registrado.");
-
         } catch (Exception e) {
             Log.e(TAG, "[SERVICE] Excecao em onCreate: " + e.getMessage(), e);
             sRunning = false;
@@ -185,57 +174,56 @@ public class BluetoothServiceIndustrial extends Service {
         return mBinder;
     }
 
-    public static boolean isRunning() {
-        return sRunning;
-    }
+    public static boolean isRunning() { return sRunning; }
 
     // =========================================================================
-    // API publica
+    // API publica — metodos novos
     // =========================================================================
 
-    /**
-     * Inicia conexao BLE buscando o dispositivo pelo nome CHOPP_XXXX.
-     *
-     * @param mac     MAC BLE do dispositivo (ex: "48:F6:EE:23:2A:6C") — usado para validacao pos-scan.
-     * @param wifiMac MAC WiFi do dispositivo — usado para derivar o nome BLE esperado.
-     *                Se null, usa mac como referencia de derivacao.
-     */
     public void connectWithMac(String mac, String wifiMac) {
         mTargetMac     = mac;
         mTargetWifiMac = wifiMac != null ? wifiMac : mac;
         Log.i(TAG, "[CONNECT] connectWithMac(" + mac + ")");
-        Log.i(TAG, "[CONNECT] Nome BLE direto esperado: "
-                + BleConfigUtils.deriveBleNameFromWifiMac(mTargetWifiMac));
-        Log.i(TAG, "[CONNECT] Nome BLE invertido esperado: "
-                + BleConfigUtils.deriveBleNameFromWifiMacInverted(mTargetWifiMac));
         mReconnectCount = 0;
         startScanCycle();
     }
 
-    /** Sobrecarga de compatibilidade — quando so ha um MAC (BLE = WiFi). */
-    public void connectWithMac(String mac) {
-        connectWithMac(mac, mac);
-    }
+    public void connectWithMac(String mac) { connectWithMac(mac, mac); }
 
-    /** Envia um comando para o ESP32 via caracteristica RX. */
+    /**
+     * Envia comando para o ESP32 via caracteristica RX.
+     * Alias: write(String) — compatibilidade com chamadas existentes.
+     */
     public boolean sendCommand(String command) {
         if (mState != State.READY && mState != State.CONNECTED) {
             Log.w(TAG, "[CMD] Ignorado (estado=" + mState + "): " + command);
             return false;
         }
-        if (mRxChar == null || mGatt == null) {
-            Log.w(TAG, "[CMD] RxChar ou GATT nulo");
-            return false;
-        }
+        if (mRxChar == null || mGatt == null) return false;
         byte[] bytes = (command + "\n").getBytes();
         mRxChar.setValue(bytes);
         mRxChar.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
         boolean ok = mGatt.writeCharacteristic(mRxChar);
-        Log.d(TAG, "[CMD] Enviado=" + ok + " cmd=" + command.trim());
+        Log.d(TAG, "[CMD] ok=" + ok + " cmd=" + command.trim());
         return ok;
     }
 
-    /** Desconecta e para de reconectar. */
+    /** Alias de compatibilidade: write(String) -> sendCommand(String) */
+    public boolean write(String command) { return sendCommand(command); }
+
+    /** Alias de compatibilidade: connected() -> isReady() */
+    public boolean connected() { return mState == State.READY || mState == State.CONNECTED; }
+
+    /** Inicia ou para o scan BLE. Alias de compatibilidade: scanLeDevice(boolean) */
+    public void scanLeDevice(boolean enable) {
+        if (enable) {
+            startScanCycle();
+        } else {
+            stopScan();
+            mState = State.IDLE;
+        }
+    }
+
     public void disconnect(boolean stopReconnect) {
         if (stopReconnect) {
             mReconnectCount = MAX_RECONNECT;
@@ -243,50 +231,28 @@ public class BluetoothServiceIndustrial extends Service {
             mHandler.removeCallbacks(mScanTimeoutRunnable);
         }
         stopScan();
-        if (mGatt != null) {
-            mGatt.disconnect();
-            mGatt.close();
-            mGatt = null;
-        }
-        mState  = State.IDLE;
-        mRxChar = null;
-        mTxChar = null;
+        if (mGatt != null) { mGatt.disconnect(); mGatt.close(); mGatt = null; }
+        mState = State.IDLE; mRxChar = null; mTxChar = null;
     }
 
-    public String getCurrentStatus() {
-        return mState.name().toLowerCase();
-    }
+    public String getCurrentStatus() { return mState.name().toLowerCase(); }
 
     // =========================================================================
-    // Scan BLE - por prefixo de nome "CHOPP_" (nao por MAC direto)
+    // Scan BLE — por prefixo "CHOPP_" (nao por MAC direto)
     // =========================================================================
 
     private void startScanCycle() {
         stopScan();
         if (mAdapter == null || !mAdapter.isEnabled()) return;
-
         mScanner = mAdapter.getBluetoothLeScanner();
-        if (mScanner == null) {
-            Log.e(TAG, "[SCAN] BluetoothLeScanner nulo");
-            scheduleReconnect("scanner_null");
-            return;
-        }
+        if (mScanner == null) { scheduleReconnect("scanner_null"); return; }
 
         boolean fallback = mReconnectCount >= 2;
         Log.i(TAG, "[SCAN] Iniciando ciclo de conexao" + (fallback ? " [MODO FALLBACK - prefixo CHOPP_]" : ""));
         Log.i(TAG, "[SCAN] MAC alvo: " + mTargetMac);
-        Log.i(TAG, "[SCAN] Nome esperado: " + BleConfigUtils.deriveBleNameFromWifiMac(mTargetWifiMac));
-
-        if (fallback) {
-            Log.w(TAG, "[FALLBACK] Iniciando scan permissivo - procurando qualquer dispositivo com prefixo 'CHOPP_'");
-            Log.w(TAG, "[FALLBACK] MAC esperado (referencia): " + mTargetMac);
-        }
 
         ScanSettings settings = new ScanSettings.Builder()
-                .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-                .build();
-
-        // Sem filtro de nome no ScanFilter para aceitar as duas variantes (direta e invertida)
+                .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build();
         List<ScanFilter> filters = new ArrayList<>();
 
         mState = State.SCANNING;
@@ -305,10 +271,7 @@ public class BluetoothServiceIndustrial extends Service {
 
     private void onScanTimeout() {
         if (mState != State.SCANNING) return;
-        boolean fallback = mReconnectCount >= 2;
-        if (fallback) {
-            Log.w(TAG, "[FALLBACK] Timeout - nenhum dispositivo CHOPP_ encontrado no ar.");
-        }
+        Log.w(TAG, "[SCAN] Timeout — nenhum dispositivo CHOPP_ encontrado");
         stopScan();
         scheduleReconnect("scan_timeout");
     }
@@ -317,23 +280,24 @@ public class BluetoothServiceIndustrial extends Service {
         @Override
         public void onScanResult(int callbackType, ScanResult result) {
             BluetoothDevice device = result.getDevice();
-            ScanRecord     record  = result.getScanRecord();
+            ScanRecord record = result.getScanRecord();
             String deviceName = (record != null) ? record.getDeviceName() : null;
             if (deviceName == null) deviceName = device.getName();
 
-            // So processa dispositivos CHOPP_
             if (!BleConfigUtils.isChoppDevice(deviceName)) return;
+            Log.d(TAG, "[SCAN] Encontrado: " + deviceName + " MAC=" + device.getAddress());
 
-            Log.d(TAG, "[SCAN] Encontrado: " + deviceName + " | MAC=" + device.getAddress());
-
-            boolean nameMatch   = BleConfigUtils.matchesBleNameForMac(deviceName, mTargetWifiMac);
-            boolean macMatch    = device.getAddress().equalsIgnoreCase(mTargetMac);
-            boolean fallbackOk  = mReconnectCount >= 2;
+            boolean nameMatch  = BleConfigUtils.matchesBleNameForMac(deviceName, mTargetWifiMac);
+            boolean macMatch   = device.getAddress().equalsIgnoreCase(mTargetMac);
+            boolean fallbackOk = mReconnectCount >= 2;
 
             if (nameMatch || macMatch || fallbackOk) {
-                if (!nameMatch && !macMatch) {
-                    Log.w(TAG, "[FALLBACK] Aceitando " + deviceName + " por fallback apos " + mReconnectCount + " falhas");
-                }
+                if (!nameMatch && !macMatch)
+                    Log.w(TAG, "[FALLBACK] Aceitando " + deviceName + " por fallback");
+                // Notificar device encontrado (compatibilidade)
+                Intent di = new Intent(ACTION_DEVICE_FOUND);
+                di.putExtra(EXTRA_DEVICE, device.getAddress());
+                sendBroadcast(di);
                 stopScan();
                 connectGatt(device);
             }
@@ -347,13 +311,12 @@ public class BluetoothServiceIndustrial extends Service {
     };
 
     // =========================================================================
-    // Conexao GATT - Just Works (sem createBond, sem PIN)
+    // Conexao GATT — Just Works (sem createBond, sem PIN)
     // =========================================================================
 
     private void connectGatt(BluetoothDevice device) {
         Log.i(TAG, "[GATT] Conectando a " + device.getAddress());
         mState = State.CONNECTING;
-        // Just Works: autoConnect=false, TRANSPORT_LE, sem createBond()
         mGatt = device.connectGatt(this, false, mGattCallback, BluetoothDevice.TRANSPORT_LE);
     }
 
@@ -365,14 +328,10 @@ public class BluetoothServiceIndustrial extends Service {
                 Log.i(TAG, "[GATT] Conectado");
                 mState = State.CONNECTED;
                 broadcastStatus(STATUS_CONNECTED);
-                // Conforme doc: sem createBond() - ir direto para requestMtu
                 gatt.requestMtu(BleConfigUtils.MTU_REQUESTED);
-
             } else if (newState == BluetoothGatt.STATE_DISCONNECTED) {
                 Log.w(TAG, "[GATT] Desconectado (status=" + status + ")");
-                mState  = State.IDLE;
-                mRxChar = null;
-                mTxChar = null;
+                mState = State.IDLE; mRxChar = null; mTxChar = null;
                 mHandler.removeCallbacks(mPingRunnable);
                 if (mGatt != null) { mGatt.close(); mGatt = null; }
                 broadcastStatus(STATUS_DISCONNECTED + ":gatt_" + status);
@@ -382,59 +341,37 @@ public class BluetoothServiceIndustrial extends Service {
 
         @Override
         public void onMtuChanged(BluetoothGatt gatt, int mtu, int status) {
-            Log.i(TAG, "[GATT] MTU negociado: " + mtu);
-            // Conforme doc: apos MTU, descobrir servicos
+            Log.i(TAG, "[GATT] MTU=" + mtu);
             gatt.discoverServices();
         }
 
         @Override
         public void onServicesDiscovered(BluetoothGatt gatt, int status) {
-            if (status != BluetoothGatt.GATT_SUCCESS) {
-                Log.e(TAG, "[GATT] Falha ao descobrir servicos: " + status);
-                gatt.disconnect();
-                return;
-            }
+            if (status != BluetoothGatt.GATT_SUCCESS) { gatt.disconnect(); return; }
             Log.i(TAG, "[GATT] Servicos descobertos");
-
             BluetoothGattService service = gatt.getService(UUID_SERVICE);
             if (service == null) {
-                Log.e(TAG, "[GATT] Servico NUS nao encontrado! UUID=" + UUID_SERVICE);
-                gatt.disconnect();
-                return;
+                Log.e(TAG, "[GATT] Servico NUS nao encontrado UUID=" + UUID_SERVICE);
+                gatt.disconnect(); return;
             }
-
             mRxChar = service.getCharacteristic(UUID_RX);
             mTxChar = service.getCharacteristic(UUID_TX);
+            if (mRxChar == null || mTxChar == null) { gatt.disconnect(); return; }
 
-            if (mRxChar == null || mTxChar == null) {
-                Log.e(TAG, "[GATT] Caracteristicas RX/TX nao encontradas");
-                gatt.disconnect();
-                return;
-            }
-
-            // Habilitar notificacoes na TX (descriptor 0x2902)
             gatt.setCharacteristicNotification(mTxChar, true);
-            BluetoothGattDescriptor descriptor = mTxChar.getDescriptor(UUID_CCCD);
-            if (descriptor != null) {
-                descriptor.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
-                gatt.writeDescriptor(descriptor);
-                Log.d(TAG, "[GATT] Habilitando notificacoes TX");
+            BluetoothGattDescriptor desc = mTxChar.getDescriptor(UUID_CCCD);
+            if (desc != null) {
+                desc.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
+                gatt.writeDescriptor(desc);
             } else {
-                Log.w(TAG, "[GATT] Descriptor 0x2902 nao encontrado - prosseguindo sem ele");
                 onReady();
             }
         }
 
         @Override
         public void onDescriptorWrite(BluetoothGatt gatt, BluetoothGattDescriptor descriptor, int status) {
-            Log.i(TAG, "[GATT] onDescriptorWrite status=" + status);
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                // Conforme doc: apos onDescriptorWrite, estado READY
-                onReady();
-            } else {
-                Log.e(TAG, "[GATT] Falha ao escrever descriptor: " + status);
-                gatt.disconnect();
-            }
+            if (status == BluetoothGatt.GATT_SUCCESS) onReady();
+            else { Log.e(TAG, "[GATT] Falha descriptor: " + status); gatt.disconnect(); }
         }
 
         @Override
@@ -442,30 +379,26 @@ public class BluetoothServiceIndustrial extends Service {
             byte[] data = characteristic.getValue();
             if (data == null) return;
             String msg = new String(data).trim();
-            Log.d(TAG, "[RX] Recebido: " + msg);
-
-            // Processar PONG internamente para keepalive
+            Log.d(TAG, "[RX] " + msg);
             BleCommand.Response r = BleCommand.parse(msg);
-            if (r.isPong()) {
-                Log.d(TAG, "[PING] PONG recebido - sessao valida");
-            }
+            if (r.isPong()) Log.d(TAG, "[PING] PONG - sessao valida");
             broadcastData(msg);
         }
 
         @Override
         public void onCharacteristicWrite(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, int status) {
-            Log.d(TAG, "[GATT] onCharacteristicWrite status=" + status);
+            Log.d(TAG, "[GATT] write status=" + status);
         }
     };
 
     // =========================================================================
-    // Estado READY
+    // Estado READY + PING keepalive
     // =========================================================================
 
     private void onReady() {
         mState = State.READY;
         mReconnectCount = 0;
-        Log.i(TAG, "[READY] Conexao BLE pronta - iniciando PING keepalive a cada " + PING_INTERVAL_MS + "ms");
+        Log.i(TAG, "[READY] Conexao pronta - PING keepalive iniciado");
         broadcastStatus(STATUS_READY);
         updateNotification("BLE conectado");
         mHandler.removeCallbacks(mPingRunnable);
@@ -484,42 +417,26 @@ public class BluetoothServiceIndustrial extends Service {
 
     private void scheduleReconnect(String reason) {
         if (mReconnectCount >= MAX_RECONNECT) {
-            Log.e(TAG, "[RECONNECT] Maximo de tentativas atingido - desistindo");
+            Log.e(TAG, "[RECONNECT] Maximo atingido - desistindo");
             broadcastStatus(STATUS_DISCONNECTED + ":max_retries");
             return;
         }
-
         long delay = BACKOFF_MS[Math.min(mReconnectCount, BACKOFF_MS.length - 1)];
         mReconnectCount++;
-
-        Log.w(TAG, "[RECONNECT] Falha #" + mReconnectCount
-                + " - proxima tentativa (com scan) em " + delay + "ms");
-
-        if (mReconnectCount == 2) {
+        Log.w(TAG, "[RECONNECT] Falha #" + mReconnectCount + " - proxima tentativa em " + delay + "ms");
+        if (mReconnectCount == 2)
             Log.w(TAG, "[RECONNECT] " + mReconnectCount + " falhas acumuladas - proximo ciclo usara scan de fallback (CHOPP_)");
-        }
-        if (mReconnectCount == 3) {
-            Log.w(TAG, "[RECONNECT] 3 falhas - tentando refresh do cache GATT");
-            refreshGattCache();
-        }
-
+        if (mReconnectCount == 3) { Log.w(TAG, "[RECONNECT] 3 falhas - tentando refresh do cache GATT"); refreshGattCache(); }
         broadcastStatus(STATUS_DISCONNECTED + ":" + reason);
-        mHandler.postDelayed(() -> {
-            if (mState == State.IDLE || mState == State.SCANNING) {
-                startScanCycle();
-            }
-        }, delay);
+        mHandler.postDelayed(() -> { if (mState == State.IDLE || mState == State.SCANNING) startScanCycle(); }, delay);
     }
 
     private void refreshGattCache() {
         if (mGatt == null) return;
         try {
-            java.lang.reflect.Method refresh = mGatt.getClass().getMethod("refresh");
-            boolean ok = (boolean) refresh.invoke(mGatt);
-            Log.d(TAG, "[GATT] refresh() = " + ok);
-        } catch (Exception e) {
-            Log.w(TAG, "[GATT] refresh() nao disponivel: " + e.getMessage());
-        }
+            java.lang.reflect.Method m = mGatt.getClass().getMethod("refresh");
+            Log.d(TAG, "[GATT] refresh()=" + m.invoke(mGatt));
+        } catch (Exception e) { Log.w(TAG, "[GATT] refresh() indisponivel"); }
     }
 
     // =========================================================================
@@ -529,13 +446,13 @@ public class BluetoothServiceIndustrial extends Service {
     private void broadcastStatus(String status) {
         Log.d(TAG, "[STATUS] " + status);
         Intent i = new Intent(BLE_STATUS_ACTION);
-        i.putExtra("status", status);
+        i.putExtra(EXTRA_STATUS, status);
         sendBroadcast(i);
     }
 
     private void broadcastData(String data) {
         Intent i = new Intent(BLE_DATA_ACTION);
-        i.putExtra("data", data);
+        i.putExtra(EXTRA_DATA, data);
         sendBroadcast(i);
     }
 
@@ -553,11 +470,9 @@ public class BluetoothServiceIndustrial extends Service {
 
     private Notification buildNotification(String text) {
         return new NotificationCompat.Builder(this, CHANNEL_ID)
-                .setContentTitle("ChoppOn BLE")
-                .setContentText(text)
+                .setContentTitle("ChoppOn BLE").setContentText(text)
                 .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
-                .setPriority(NotificationCompat.PRIORITY_LOW)
-                .build();
+                .setPriority(NotificationCompat.PRIORITY_LOW).build();
     }
 
     private void updateNotification(String text) {
